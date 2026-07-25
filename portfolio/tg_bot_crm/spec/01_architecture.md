@@ -38,13 +38,14 @@ Router again (re-classify updated context)
     ├── block changed       → regenerate task list + required fields
     └── block stays same    → validate existing data, collect missing
     ↓
-Loop (generate script → generate response → guardrails → send → reply)
+DIALOG pipeline (script → response → guardrails → send → reply)
     ↓
-All required fields collected → save to SQLite
+All required fields collected → save to SQLite → ACTION_EXECUTE queue
     ↓
-Action Executor (CRM, Stripe, etc.)
+ACTION_DONE (report result → "still need anything?" → wait for reply)
     ↓
-Telegram User (+ demo updates + CRM link)
+    ├── client wants more → DIALOG (Router re-classifies)
+    └── client done / timeout → CLOSED
 ```
 
 ## 3. Detailed Component Descriptions
@@ -110,12 +111,12 @@ Backend: **SQLite** через `aiosqlite`.
 3. При проверке актуальности: если скрипт устарел / не соответствует ситуации → генерирует новый
 
 **Что генерирует:**
-1. `task_list` — список задач для диалога на языке пользователя (естественная форма)
+1. `task_list` — список задач для диалога на языке пользователя (естественная форма). Может содержать несколько целевых действий
 2. `required_fields` — обязательные поля для сбора
 3. `dialogue_script` — скрипт разговора
 
-**Важно:** 
-`dialogue_script` — скрипт разговора задается промптом "Нужно дать пример диалога. Важно сделать его реалистичным, с реакцией оператора, с элементами активного слушания, уточнения, завершения. Пример диалога (оператор - клиент). Можно в виде реплик. Также учтем, что скрипты должны быть для "входящей линии компании" (в месенжере). Добавим рекомендации по структуре: приветствие, идентификация, выяснение потребности, обработка возражений (если нужно), завершение. Можно кратко."
+**Примечание:**
+`dialogue_script` — скрипт разговора задается промптом: "Нужно дать пример диалога. Важно сделать его реалистичным, с реакцией оператора, с элементами активного слушания, уточнения, завершения. Пример диалога (оператор - клиент). Можно в виде реплик. Также учтем, что скрипты должны быть для 'входящей линии компании' (в месенжере). Добавим рекомендации по структуре: приветствие, идентификация, выяснение потребности, обработка возражений (если нужно), завершение. Можно кратко."
 Ответ пользователю — это **не цитата** из скрипта. Скрипт используется как дополнительный контекст для генерации актуального сообщения.
 
 ### 3.5 Response Generator (`src/dialogue/response_generator.py`)
@@ -217,11 +218,16 @@ human_review/
 
 Выполняет целевое действие когда все обязательные поля собраны.
 
+**Очередь действий:**
+- `task_list` из Script Generator может содержать несколько целевых действий
+- Action Executor выполняет их последовательно
+- После каждого действия — сообщение с результатом в демо-режиме
+
 **Модульная система блоков:** Каждый блок и его целевое действие — отдельный подмодуль в `src/executor/blocks/`.
 
 ```
 src/executor/blocks/
-├── base.py              # Abstract base: required_fields, execute(), tools
+├── base.py              # Abstract base: required_fields, execute(), tool_schemas
 ├── block_1_sales.py     # Продажи и новые возможности
 ├── block_2_support.py   # Поддержка существующих клиентов
 ├── block_3_info.py      # Информационные запросы
@@ -233,14 +239,26 @@ src/executor/blocks/
 
 **Целевые действия по блокам:**
 - **Блок 1:** Лид в Google Sheets + Stripe-payment link (тестовый режим)
-- **Блок 2:** Тикет в Google Сsheets + номер заявки
+- **Блок 2:** Тикет в Google Sheets + номер заявки
 - **Блок 4:** Корзина + Stripe ссылка на оплату
 
 **Легкое добавление/удаление блоков:**
 - Новый блок: создать файл в `executor/blocks/`, унаследовать `BlockAction`, зарегистрировать в `registry.py`
 - Удаление: удалить файл и запись в реестре
 - Новое целевое действие: добавить функцию в `BlockAction.execute_action()`
-- Новые обязательные поля: добавить в `BlockAction.required_fieldss`
+- Новые обязательные поля: добавить в `BlockAction.required_fields`
+
+### 3.9.1 Post-Action Logic (`ACTION_DONE`)
+
+После выполнения всех действий из очереди:
+
+1. Отправить итоговое сообщение с информацией о сделанном
+2. Если действий было несколько — перечислить что выполнено
+3. Вежливо спросить: «Могу ли я ещё чем-то помочь?»
+4. Ждать ответ пользователя:
+   - **"Да, хочу X"** — router определяет новый/другой блок → DIALOG (с начала)
+   - **"Нет, спасибо"** или явное прощание → CLOSED
+   - **Клиент молчит** / таймаут (значение из конфига) → CLOSED
 
 ### 3.10 Config Watcher (`src/config_watcher.py`)
 
@@ -251,12 +269,14 @@ src/executor/blocks/
 - При изменении — перечитать файл, обновить глобальные настройки
 - Настройки, которые обновляются: лимиты повторой проверки, интервал проверки human_review, список полей по умолчанию, пути к данным
 
-## 4. LLM Client (`src/llm_client/`)
+## 8. LLM Client & Tools Registry
 
-Единый модуль для всех LLM-запросов. OpenAI-совместимое API.
+### 9.1 LLM Client (`src/llm_client/client.py`)
+
+Единый модуль для всех LLM-запросов. OpenAI-совместимое API. Детально в `spec/02_llm_client.md`.
 
 **Failover-логика:**
-- Модели сгрупппорованы (`group="router"`, `group="dialogue"`, `group="guardrails"`, etc.)
+- Модели сгруппированы (`group="router"`, `group="dialogue"`, `group="guardrails"`, etc.)
 - В группе модели с приоритетами
 - Запрос → первая модель → ошибка → вторая → ...
 - Если все недоступны → пауза 1s → повтор → 2s → 4s → 8s → 16s → 32s → 64s → 128s → 256s → reset (10 циклов)
@@ -285,62 +305,95 @@ llm_groups:
       model: "gpt-4o-mini"
 ```
 
-## 5. CRM: Google Sheets (`src/executor/crm.py`)
+### 9.2 Tools Registry (`src/llm_client/tools/`)
+
+Централизованный реестр function calling инструментов. Детально в `spec/03_tools_registry.md`.
+
+```
+src/llm_client/tools/
+├── registry.py       # реестр инструментов: имя → класс Tool
+├── base.py           # абстрактный класс Tool с JSON Schema
+├── create_lead.py    # создание лида в Google Sheets
+├── create_payment.py # генерация Stripe-payment ссылки
+├── create_ticket.py  # создание тикета поддержки
+└── request_human.py  # запрос руководителю
+```
+
+Каждый tool:
+- **JSON Schema** (name, description, parameters) — что передаётся в `tools` параметр к OpenAI API
+- **execute()** — функция, вызываемая когда модель принимает решение использовать tool
+- **Группа доступа** — какие LLM-группы могут использовать этот tool
+
+## 4. CRM: Google Sheets (`src/executor/crm.py`)
 
 - Отдельная таблица на каждого пользователя бота
 - Сервисный аккаунт Google
 - Права редактирования: всем у кого есть ссылка
 - Ссылка отправляется в demo-сообщение после создания
 
-## 6. Database: SQLite (`src/dialogue/db.py`)
+## 5. Database: SQLite (`src/dialogue/db.py`)
 
 Таблицы: `sessions`, `leads`, `tickets`. Async через `aiosqlite`.
 Детальная схема в `spec/08_database.md`.
 
-## 7. Config & Secrets
+## 6. Config & Secrets
 
 - `config.yaml` — LLM groups, retry limits, block settings, watching intervals, data paths
 - `.env` — API keys (Telegram, OpenAI, Google Sheets service account, Stripe)
 - `data/company_info.json` — FAQ, цены, контакты, политики
 - `data/` — доп. эталонные документы для guardrails
 
-## 8. FSM States
+## 7. FSM States
 
 ```
-WELCOME → ROUTER → SCRIPT → COLLECT ←─┐
-                        ↑_____↓         │
-                        loop (cycle) ────┘
-                        ↓
-                     ACTION → CLOSED
+WELCOME
+  │
+  ▼
+DIALOG ──────────────────────────────────────────┐
+  │  для каждого сообщения:                       │
+  │  Router → Script → Response → Guardrails → Send│
+  │                                                │
+  ▼ (все обязательные поля собраны → save to SQLite)
+ACTION_EXECUTE
+  │
+  ├── ▶ action #1 из очереди → сообщение с результатом
+  ├── ▶ action #2 → сообщение → ...
+  └── ▶ все выполнены
+  │
+  ▼
+ACTION_DONE (итог + "помочь ещё чем-то?")
+  │
+  ├── ▶ клиент хочет ещё → DIALOG
+  ├── ▶ клиент прощается → CLOSED
+  └── ▶ таймаут → CLOSED
 ```
 
 ### Состояния
 
 | State | Описание |
 |---|---|
-| `WELCOME` | Приветственное сообщение, представление бота |
-| `ROUTER` | Вызов Router для классификации языка, tone, block_id |
-| `SCRIPT` | Проверка/генерация скрипта, списка задач, обязательных полей |
-| `COLLECT` | Цикл: запросить поле → получить ответ → валидировать → сохранить |
-| `ACTION` | Все поля собраны → выполнить целевое действие |
+| `WELCOME` | Приветственное сообщение, представление бота. Сразу переходит в DIALOG |
+| `DIALOG` | Основной цикл. Pipeline: Router → Script → Response → Guardrails → Send. Повторяется для каждого сообщения пользователя |
+| `ACTION_EXECUTE` | Все обязательные поля собраны. Выполняет целевую инструкцию из очереди. После каждого — сообщение с результатом |
+| `ACTION_DONE` | Все действия выполнены, выводится "что ещё нужно?" с опцией перехода в DIALOG |
 | `CLOSED` | Диалог завершён |
 
-### COLLECT loop (детально):
+### DIALOG pipeline (для каждого сообщения пользователя):
 
 1. User replies
-2. Router: переклассифицировать сообщение (проверить язык, тон, не изменился ли блок)
+2. Router: переклассифицировать сообщение (язык, тон, блок, извлечь данные)
    - Блок изменился → сгенерировать новые задачи и обязательные поля
    - Блок не изменился → проверить валидность имеющихся данных →
-     - Если все обязательные поля собраны → ACTION
-     - Если нет → добавить недостатки
-3. Сгенерировать скрипт (если блок изменился — перегенерировать задачи и поля)
+     - Если все обязательные поля собраны → сохранить в SQLite → ACTION_EXECUTE
+     - Если нет → продолжить
+3. Сгенерировать/актуализировать скрипт
 4. Сгенерировать ответ пользователю (с учётом скрипта как контекста)
 5. Guardrails: проверить ответ на соответствие документам
    - Если не прошёл → отредактировать / переписать → проверка снова
    - Если лимит исчерпан → создать файл в `human_review/pending/`
-6. Отправить ответ пользователю → вернуться к шагу 1
+6. Отправить ответ пользователю → ждать следующего сообщения → шаг 1
 
-## 10. File Map
+## 9. File Map
 
 ```
 src/
@@ -348,7 +401,14 @@ src/
 ├── config.py                     # load config.yaml + .env, config watcher
 ├── llm_client/
 │   ├── client.py                 # failover LLM client
-│   └── groups.py                 # group config parsing
+│   ├── groups.py                   # group config parsing
+│   └── tools/                       # centralized tool registry
+│       ├── registry.py            # tool registry: name → class
+│       ├── base.py                  # abstract Tool class w/ JSON Schema
+│       ├── create_lead.py        # create lead in Google Sheets
+│       ├── create_payment.py    # generate Stripe payment link
+│       ├── create_ticket.py      # create support ticket
+│       └── request_human.py   # request human supervisor
 ├── classifier/
 │   └── router.py                  # language + tone + block_id + intent
 ├── context/
@@ -383,7 +443,7 @@ src/
 │   └── watcher.py                   # watch config.yaml for changes
 ...
 
-## 11. Key Design Decisions
+## 10. Key Design Decisions
 
 | Decision | Rationale |
 |---|---|
@@ -396,11 +456,12 @@ src/
 | Stripe тестовый режим | Не заглушка, реальный платёжный шлюз с тестовыми параметрами |
 | Блоки — отдельные модули | Легко добавлять/удалять блоки и действия |
 | Guardrails с retry до лимита | Безоставительный сценарий: составительское перекрывание протокола |
-| human_review pipeline | Делегатные вопросы товарищу через файлы |
-| Config watcher | live-reload параметров без перезагрузки |
-| Одно demo-сообщение (дописывание) | Чистый UI в Telegram, не-спам уведомлений |
+| Очередь действий в Script Generator | Поддерживает несколько target actions в одном диалоге |
+| ACTION_DONE с возможностью вернуться в DIALOG | Естественное завершение: итог + опрос + возможность продолжения |
+| Таймаут в ACTION_DONE | Клиент может забыть ответить — через N минут диалог закрывается |
+| Tools — централизованный реестр | Единый источник truth для function calling схем, общегосерверного менеджмента |
 
-## 12. Not Covered (Future)
+## 11. Not Covered (Future)
 
 - Векторное хранилище (ChromaDB/FAISS) для RAG-поиска
 - Redis for session cache
